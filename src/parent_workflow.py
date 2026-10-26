@@ -16,6 +16,7 @@ from prompts import _SYNTHESIS_PROMPT, _REVISION_PROMPT
 with workflow.unsafe.imports_passed_through():
     from activities import (
         call_llm, CallLLMInput,
+        record_review_feedback, ReviewFeedbackInput,
     )
     from child_workflow import (
         PDFSummaryWorkflow, PDFSummaryInput
@@ -53,6 +54,9 @@ class ContractReviewWorkflow:
         self._review_feedback: str = ""
         self._approved_by: str = ""
 
+        self._workflow_id: str = ""
+        self._report_run_id: Optional[str] = None
+
 
     # ── Query: status ───────────────────────────────
     @workflow.query
@@ -64,6 +68,7 @@ class ContractReviewWorkflow:
             "pdfs_processed": len(self._summaries),
             "report_preview": json.dumps(self._report, ensure_ascii=False)[:500],
             "approved_by":    self._approved_by,
+            "report_run_id":  self._report_run_id,
         }
     
     # ── Query: full report — call this before submitting a review decision ─────
@@ -109,7 +114,17 @@ class ContractReviewWorkflow:
         workflow.logger.info(f"Fanning out to {len(params.s3_paths)} child workflows")
 
         workflow_id = workflow.info().workflow_id
+        workflow_run_id = workflow.info().run_id
         workflow_task_queue = workflow.info().task_queue
+
+        self._workflow_id = workflow_id
+
+        trace_metadata = {
+            "workflow_id": workflow_id,
+            "workflow_run_id": workflow_run_id,
+            "thread_id": workflow_id,
+            "contracts": len(params.s3_paths),
+        }
 
         # TERMINATE: kill child workflows when parent closes
         # REQUEST_CANCEL: ask child workflows to cancel gracefully
@@ -172,7 +187,8 @@ class ContractReviewWorkflow:
         llm_result = await workflow.execute_activity(
             call_llm,
             CallLLMInput(
-                prompt=llm_prompt
+                prompt=llm_prompt,
+                trace_metadata={**trace_metadata, "stage": "synthesis"},
             ),
             start_to_close_timeout=timedelta(minutes=3),
             heartbeat_timeout=timedelta(seconds=180),
@@ -180,6 +196,9 @@ class ContractReviewWorkflow:
         )
 
         self._report = json_repair.loads(llm_result.content)
+
+        # LangSmith run that produced the report — human feedback attaches here.
+        self._report_run_id = llm_result.run_id
     
         # Step 3: HITL — pause until a human approves or requests revision.
         # The reviewer should call get_report (Query) to read the full report
@@ -203,6 +222,25 @@ class ContractReviewWorkflow:
 
             if self._review_decision == "approve":
                 workflow.logger.info(f"Approved by: {self._approved_by}")
+
+            # Log the human decision on the report run it refers to.
+            # Best-effort: the activity never raises.
+            await workflow.execute_activity(
+                record_review_feedback,
+                ReviewFeedbackInput(
+                    run_id=self._report_run_id,
+                    decision=self._review_decision,
+                    feedback=self._review_feedback,
+                    workflow_id=self._workflow_id,
+                ),
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=1),
+                    maximum_attempts=2,
+                ),
+            )
+
+            if self._review_decision == "approve":
                 break
 
             self._status = "revising"
@@ -218,13 +256,21 @@ class ContractReviewWorkflow:
 
             revised_report = await workflow.execute_activity(
                 call_llm,
-                CallLLMInput(prompt=llm_prompt),
+                CallLLMInput(
+                    prompt=llm_prompt,
+                    trace_metadata={
+                        **trace_metadata,
+                        "stage": "revision",
+                        "revision_no": revision_no,
+                    },
+                ),
                 start_to_close_timeout=timedelta(minutes=3),
                 heartbeat_timeout=timedelta(seconds=180),
                 retry_policy=DEFAULT_RETRY_POLICY,
             )
 
             self._report = json_repair.loads(revised_report.content)
+            self._report_run_id = revised_report.run_id
 
         # REVISED COMPLETED
         self._status = "completed"

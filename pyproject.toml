@@ -15,4 +15,5 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "pydantic",
+    "langsmith>=0.14.12",
 ]
