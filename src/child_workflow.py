@@ -36,12 +36,25 @@ class PDFSummaryWorkflow:
     
     @workflow.run
     async def run(self, params: PDFSummaryInput) -> PDFSummaryOutput:
-        
+
+        workflow_id = workflow.info().workflow_id
+        parent = workflow.info().parent
+
+        # Group every run belonging to the same review under one thread.
+        trace_metadata = {
+            "workflow_id": workflow_id,
+            "workflow_run_id": workflow.info().run_id,
+            "thread_id": parent.workflow_id if parent else workflow_id,
+            "stage": "summary",
+            "s3_path": params.s3_path,
+        }
+
         # execute: extract_pdf
         extracted_md = await workflow.execute_activity(
             extract_pdf,
             ExtractPDFInput(
-                s3_path=params.s3_path
+                s3_path=params.s3_path,
+                trace_metadata=trace_metadata,
             ),
             retry_policy=DEFAULT_RETRY_POLICY,
             start_to_close_timeout=timedelta(minutes=20),
@@ -57,7 +70,8 @@ class PDFSummaryWorkflow:
         llm_result = await workflow.execute_activity(
             call_llm,
             CallLLMInput(
-                prompt=prompt
+                prompt=prompt,
+                trace_metadata=trace_metadata,
             ),
             retry_policy=DEFAULT_RETRY_POLICY,
             start_to_close_timeout=timedelta(minutes=5),
